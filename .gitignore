@@ -1,0 +1,8 @@
+# Only these three folders go into the repository; everything else in this folder stays local.
+/*
+!/.gitignore
+!/bootstrap/
+!/contour-lms/
+!/document/
+
+.DS_Store

@@ -1,0 +1,548 @@
+openapi: 3.0.3
+
+info:
+  title: Mini LMS API
+  version: 1.0.0
+  description: |
+    REST API of the Mini LMS consultation-booking app (Next.js Route Handlers).
+
+    ## Authentication
+    Cookie session issued by Supabase Auth (`signInWithPassword`) and managed by
+    `@supabase/ssr`. The browser sends the cookie automatically; there is no
+    `Authorization` header. The cookie is named `sb-<project-ref>-auth-token`
+    (`sb-127-auth-token` for the local stack) and may be split into chunks
+    (`.0`, `.1`, ...) when large.
+
+    ## Roles (RBAC)
+    | Role | Can do |
+    |---|---|
+    | `student` | Create, list, reschedule, complete and cancel **their own** consultations |
+    | `admin` | **Read-only** list of every consultation |
+
+    Authorization is layered: route guard (`401` / `403`) → PostgreSQL Row Level
+    Security → a database trigger enforcing business rules (`409`).
+
+    ## Business rules (violations return `409 rule_violation`)
+    - `scheduled_at` must be in the future (also checked as `422` before the DB).
+    - A **cancelled** consultation is final: it cannot be changed any more.
+    - A **completed** consultation cannot be rescheduled or cancelled; un-tick
+      "completed" first.
+    - A consultation cannot be both cancelled and completed.
+
+    ## Errors
+    Every error uses the same envelope:
+    ```json
+    { "error": { "code": "validation_error", "message": "Invalid input", "details": { "fields": { "reason": ["Reason is required"] } } } }
+    ```
+
+    ## Conventions
+    - JSON field names are `snake_case`, identical to the database columns.
+    - Timestamps are ISO-8601 in UTC; **requests must include a timezone offset**.
+    - Row ids are UUIDs. Other people's ids answer `404` (never `403`) so ids cannot be probed.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: Consultations
+    description: Student-facing endpoints
+  - name: Admin
+    description: Admin-only endpoints
+  - name: Ops
+    description: Operational endpoints (no authentication)
+
+security:
+  - cookieAuth: []
+
+paths:
+  /api/health:
+    get:
+      tags: [Ops]
+      operationId: healthCheck
+      summary: Liveness probe
+      description: |
+        Public. Answers `200` while the server process is serving requests. It does
+        **not** query the database on purpose, so a database outage cannot put the
+        containers into a restart loop. Used by the load balancer health check.
+      security: []
+      responses:
+        "200":
+          description: The server is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+
+  /api/consultations:
+    get:
+      tags: [Consultations]
+      operationId: listMyConsultations
+      summary: List my consultations
+      description: |
+        Returns the **caller's own** consultations (an admin calling this also only
+        gets their own; admins use `/api/admin/consultations`).
+        `upcoming` = scheduled and not completed. Ordered by `scheduled_at`
+        (ascending for `upcoming`, descending otherwise), then `id`.
+      parameters:
+        - $ref: "#/components/parameters/Filter"
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: A page of consultations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedConsultations"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      tags: [Consultations]
+      operationId: createConsultation
+      summary: Book a consultation
+      description: |
+        **Students only.** The owner (`student_id`) is taken from the verified
+        session and never from the body; unknown body fields are ignored.
+        New consultations are always `scheduled` and not completed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateConsultation"
+            example:
+              first_name: Sam
+              last_name: Student
+              reason: Course selection advice
+              scheduled_at: "2026-12-01T09:30:00.000Z"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Consultation"
+        "400":
+          $ref: "#/components/responses/InvalidJson"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/consultations/{id}:
+    patch:
+      tags: [Consultations]
+      operationId: updateConsultation
+      summary: Reschedule, complete/un-complete, or cancel a consultation
+      description: |
+        **Students only, on their own consultations.** One endpoint, three
+        operations selected by `action`; each has its own strict payload so a
+        client cannot smuggle extra changes into a request.
+
+        | `action` | Effect | Extra field |
+        |---|---|---|
+        | `reschedule` | Moves the consultation | `scheduled_at` (future) |
+        | `set_completed` | Ticks / un-ticks "completed" | `is_completed` |
+        | `cancel` | Soft-deletes (status → `cancelled`), final | — |
+
+        If the id does not exist **or belongs to someone else**, the answer is `404`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateConsultation"
+            examples:
+              reschedule:
+                summary: Reschedule
+                value:
+                  action: reschedule
+                  scheduled_at: "2026-12-08T14:00:00.000Z"
+              complete:
+                summary: Mark as completed
+                value:
+                  action: set_completed
+                  is_completed: true
+              cancel:
+                summary: Cancel
+                value:
+                  action: cancel
+      responses:
+        "200":
+          description: Updated consultation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Consultation"
+        "400":
+          $ref: "#/components/responses/InvalidJson"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/RuleViolation"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/admin/consultations:
+    get:
+      tags: [Admin]
+      operationId: listAllConsultations
+      summary: List every consultation (admin, read-only)
+      description: |
+        **Admins only** (`403` for students). Includes the booking account's
+        email in `student`. Enforced twice: the route guard and the RLS select policy.
+      parameters:
+        - $ref: "#/components/parameters/Filter"
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: A page of consultations from all students
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PagedConsultations"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sb-127-auth-token
+      description: |
+        Supabase session cookie, set automatically after login in the browser.
+        Name is `sb-<project-ref>-auth-token`; `sb-127-auth-token` locally.
+        (Swagger UI "Try it out" cannot set cookies itself: sign in at the app
+        in the same browser, then the requests are authenticated.)
+
+  parameters:
+    Filter:
+      name: filter
+      in: query
+      schema:
+        type: string
+        enum: [all, upcoming, completed, cancelled]
+        default: all
+    Page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      name: page_size
+      in: query
+      description: Capped at 50 to protect the database.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 20
+
+  schemas:
+    ConsultationStatus:
+      type: string
+      enum: [scheduled, cancelled]
+
+    Student:
+      type: object
+      nullable: true
+      description: Profile of the account that booked (embedded via foreign key).
+      required: [email, first_name, last_name]
+      properties:
+        email:
+          type: string
+          format: email
+        first_name:
+          type: string
+        last_name:
+          type: string
+
+    Consultation:
+      type: object
+      required:
+        - id
+        - student_id
+        - first_name
+        - last_name
+        - reason
+        - scheduled_at
+        - status
+        - is_completed
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        student_id:
+          type: string
+          format: uuid
+          description: Owner. Set by the server from the session.
+        first_name:
+          type: string
+          maxLength: 100
+          description: Who the consultation is for (independent of the account name).
+        last_name:
+          type: string
+          maxLength: 100
+        reason:
+          type: string
+          maxLength: 1000
+        scheduled_at:
+          type: string
+          format: date-time
+          description: UTC.
+        status:
+          $ref: "#/components/schemas/ConsultationStatus"
+        is_completed:
+          type: boolean
+          description: The student's own tick; independent of `status`.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        student:
+          $ref: "#/components/schemas/Student"
+      example:
+        id: 7b0c3a52-4d5e-4c1b-9a43-5d8f0e2a9c11
+        student_id: 22222222-2222-2222-2222-222222222222
+        first_name: Sam
+        last_name: Student
+        reason: Course selection advice
+        scheduled_at: "2026-12-01T09:30:00.000Z"
+        status: scheduled
+        is_completed: false
+        created_at: "2026-11-25T05:00:00.000Z"
+        updated_at: "2026-11-25T05:00:00.000Z"
+        student:
+          email: student1@example.com
+          first_name: Sam
+          last_name: Student
+
+    CreateConsultation:
+      type: object
+      required: [first_name, last_name, reason, scheduled_at]
+      properties:
+        first_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Trimmed before validation.
+        last_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        scheduled_at:
+          type: string
+          format: date-time
+          description: ISO-8601 **with timezone offset**, in the future.
+
+    UpdateConsultation:
+      oneOf:
+        - $ref: "#/components/schemas/RescheduleAction"
+        - $ref: "#/components/schemas/SetCompletedAction"
+        - $ref: "#/components/schemas/CancelAction"
+      discriminator:
+        propertyName: action
+        mapping:
+          reschedule: "#/components/schemas/RescheduleAction"
+          set_completed: "#/components/schemas/SetCompletedAction"
+          cancel: "#/components/schemas/CancelAction"
+
+    RescheduleAction:
+      type: object
+      required: [action, scheduled_at]
+      properties:
+        action:
+          type: string
+          enum: [reschedule]
+        scheduled_at:
+          type: string
+          format: date-time
+          description: ISO-8601 with timezone offset, in the future.
+
+    SetCompletedAction:
+      type: object
+      required: [action, is_completed]
+      properties:
+        action:
+          type: string
+          enum: [set_completed]
+        is_completed:
+          type: boolean
+
+    CancelAction:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [cancel]
+
+    PagedConsultations:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Consultation"
+        meta:
+          type: object
+          required: [page, page_size, total]
+          properties:
+            page:
+              type: integer
+            page_size:
+              type: integer
+            total:
+              type: integer
+              description: Total matching rows (for the pager).
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - unauthorized
+                - forbidden
+                - not_found
+                - invalid_json
+                - validation_error
+                - rule_violation
+                - internal_error
+            message:
+              type: string
+            details:
+              type: object
+              description: Only for `validation_error`.
+              properties:
+                fields:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items:
+                      type: string
+
+  responses:
+    InvalidJson:
+      description: Body is not valid JSON
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: { code: invalid_json, message: Request body must be valid JSON }
+    Unauthorized:
+      description: Not signed in
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: { code: unauthorized, message: You must be signed in }
+    Forbidden:
+      description: Signed in, but the role is not allowed to do this
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: { code: forbidden, message: You do not have permission to do this }
+    NotFound:
+      description: Does not exist, or belongs to someone else
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: { code: not_found, message: Not found }
+    RuleViolation:
+      description: A business rule was violated (enforced by a database trigger)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: rule_violation
+              message: a cancelled consultation can no longer be modified
+    ValidationError:
+      description: Input failed validation
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: validation_error
+              message: Invalid input
+              details:
+                fields:
+                  reason: [Reason is required]
+    InternalError:
+      description: Unexpected server error (details are logged, never returned)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: { code: internal_error, message: Something went wrong }
